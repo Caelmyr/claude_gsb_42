@@ -368,13 +368,17 @@ class JudgeEngine:
         # 同步内存 recent 列表中的状态
         settings = read_json(config.SETTINGS_FILE, config.DEFAULT_SETTINGS)
         if (settings or {}).get("judge", {}).get("sync_recent_cache", True):
-            return updated
-        with self._lock:
-            for s in self._recent:
-                if s["id"] == sub_id:
-                    s.update(status=status, score=score, time_ms=time_ms,
-                             memory_kb=memory_kb, judged_at=now_iso(), details=details)
-                    break
+            with self._lock:
+                for s in self._recent:
+                    if s["id"] == sub_id:
+                        s.update(
+                            status=status, score=score, details=details,
+                            compile_message=truncate(compile_message, 4000),
+                            time_ms=time_ms, memory_kb=memory_kb,
+                            judged_at=now_iso(),
+                        )
+                        break
+        return updated
 
     def _anti_cheat(self, sub_id):
         contest_id, user_id = self._index.get(sub_id, (None, None))
@@ -423,6 +427,16 @@ class JudgeEngine:
             sub = strip_code(sub)
         return sub
 
+    def iter_submissions(self):
+        """遍历所有竞赛和用户分片中的提交记录。"""
+        for cid in list_dirs(config.SUBMISSIONS_DIR):
+            cdir = _submission_dir(cid)
+            for uid in list_files(cdir):
+                shard = read_json(os.path.join(cdir, uid + ".json"))
+                if not shard:
+                    continue
+                yield from shard.get("submissions", [])
+
     def list_submissions(self, contest_id=None, user_id=None, problem_id=None,
                          limit=50, offset=0, include_code=False):
         """列出提交（默认取全局近期列表；有过滤条件时扫描分片）。"""
@@ -433,22 +447,19 @@ class JudgeEngine:
             rows = recent
         else:
             rows = []
-            if contest_id:
-                cdir = _submission_dir(contest_id)
+            contest_dirs = [contest_id] if contest_id else list_dirs(config.SUBMISSIONS_DIR)
+            for cid in contest_dirs:
+                cdir = _submission_dir(cid)
                 for uid in list_files(cdir):
                     shard = read_json(os.path.join(cdir, uid + ".json"))
                     if not shard:
                         continue
                     for s in shard.get("submissions", []):
-                        if user_id and s["user_id"] != user_id:
+                        if user_id and s.get("user_id") != user_id:
                             continue
-                        if problem_id and s["problem_id"] != problem_id:
+                        if problem_id and s.get("problem_id") != problem_id:
                             continue
                         rows.append(s)
-            else:
-                rows = [s for s in recent
-                        if (not user_id or s.get("username") == user_id)
-                        and (not problem_id or s["problem_id"] == problem_id)]
 
         rows = sort_list(rows, key=lambda s: s.get("created_at", ""), reverse=True)
         total = len(rows)

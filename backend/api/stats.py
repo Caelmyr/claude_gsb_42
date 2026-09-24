@@ -16,8 +16,7 @@ stats_bp = Blueprint("stats", __name__)
 
 def _iter_submissions():
     """遍历所有提交分片，产出提交记录。"""
-    for s in list(engine._recent):
-        yield s
+    yield from engine.iter_submissions()
 
 
 def _iter_problems():

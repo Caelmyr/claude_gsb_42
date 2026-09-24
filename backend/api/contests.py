@@ -7,7 +7,9 @@ from backend import config
 from backend.api import ok, err, require_auth, require_admin, get_current_user
 from backend.storage import read_json, atomic_write_json, list_files
 from backend.utils import now_iso, gen_id, frozen_now
-from backend.judge.ranking import contest_status, contest_elapsed, reset_contest_scores
+from backend.judge.ranking import (
+    contest_status, contest_elapsed, reset_contest_scores, rebuild_from_submissions
+)
 
 contests_bp = Blueprint("contests", __name__)
 
@@ -119,3 +121,13 @@ def delete_contest(contest_id):
 def reset_scores(contest_id):
     reset_contest_scores(contest_id)
     return ok()
+
+
+@contests_bp.post("/contests/<contest_id>/rebuild-scores")
+@require_admin
+def rebuild_scores(contest_id):
+    contest = _load(contest_id)
+    if not contest:
+        return err("竞赛不存在", 404)
+    ranking = rebuild_from_submissions(contest)
+    return ok({"contest_id": contest_id, "rows": len(ranking.get("rows", []))})

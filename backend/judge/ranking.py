@@ -14,7 +14,7 @@
 import os
 
 from backend import config
-from backend.storage import read_json, locked_update, list_files
+from backend.storage import read_json, locked_update, atomic_write_json, list_files
 from backend.utils import now_iso, now_ts, parse_time
 
 RANKING_FILE = "ranking.json"
@@ -67,13 +67,17 @@ def empty_user_record(contest_id, user_id, username, nickname):
     }
 
 
-def _summarize(record, mode, penalty_seconds):
+def _summarize(record, mode, penalty_seconds, allowed_problem_ids=None):
     """由用户成绩分片计算榜单摘要行。"""
+    problems = record.get("problems", {})
+    if allowed_problem_ids is not None:
+        problems = {pid: p for pid, p in problems.items()
+                    if pid in allowed_problem_ids}
     solved = 0
     score = 0
     penalty = 0
     total_time_ms = 0
-    for p in record.get("problems", {}).values():
+    for p in problems.values():
         if p.get("solved"):
             solved += 1
         score += p.get("score", 0)
@@ -87,19 +91,19 @@ def _summarize(record, mode, penalty_seconds):
         "score": score,
         "penalty": penalty,
         "total_time_ms": total_time_ms,
-        "problems": record.get("problems", {}),
+        "problems": problems,
     }
 
 
 def _sort_key(row, mode):
     if mode == "acm":
         # 解题数降序，罚时升序，用时升序
-        return (-row["solved"], -row["penalty"], row["user_id"])
+        return (-row["solved"], row["penalty"], row["user_id"])
     # ioi：总分降序，用时升序
     return (-row["score"], row["total_time_ms"], row["user_id"])
 
 
-def _rebuild_ranking(contest_id, mode, penalty_seconds):
+def _rebuild_ranking(contest_id, mode, penalty_seconds, allowed_problem_ids=None):
     """重建聚合榜单（扫描该竞赛全部分片并排序）。"""
     d = _score_dir(contest_id)
     rows = []
@@ -108,7 +112,9 @@ def _rebuild_ranking(contest_id, mode, penalty_seconds):
             continue
         rec = read_json(os.path.join(d, name + ".json"))
         if rec:
-            rows.append(_summarize(rec, mode, penalty_seconds))
+            rows.append(_summarize(
+                rec, mode, penalty_seconds, allowed_problem_ids=allowed_problem_ids
+            ))
     rows.sort(key=lambda r: _sort_key(r, mode))
     for i, r in enumerate(rows):
         r["rank"] = i + 1
@@ -152,6 +158,9 @@ def record_submission(contest, user, problem_id, result):
     """
     mode = contest.get("mode", "acm")
     penalty_seconds = int(config.DEFAULT_SETTINGS["ranking"]["penalty_seconds"])
+    allowed_problem_ids = {
+        p.get("problem_id") for p in contest.get("problems", []) if p.get("problem_id")
+    }
     contest_id = contest["id"]
     user_id = user["id"]
 
@@ -161,6 +170,9 @@ def record_submission(contest, user, problem_id, result):
                 contest_id, user_id, user.get("username", ""), user.get("nickname", "")
             )
         probs = rec.setdefault("problems", {})
+        for bad_pid in list(probs):
+            if bad_pid not in allowed_problem_ids:
+                probs.pop(bad_pid, None)
         p = probs.setdefault(problem_id, {
             "solved": False, "attempts": 0, "first_solve_time": None,
             "score": 0, "time_ms": 0, "memory_kb": 0, "penalty": 0,
@@ -189,7 +201,9 @@ def record_submission(contest, user, problem_id, result):
 
     # 增量更新聚合榜单：重新扫描并排序（分数变化才触发）
     _maybe_freeze_snapshot(contest)
-    ranking = _rebuild_ranking(contest_id, mode, penalty_seconds)
+    ranking = _rebuild_ranking(
+        contest_id, mode, penalty_seconds, allowed_problem_ids=allowed_problem_ids
+    )
     locked_update(_ranking_path(contest_id), lambda _d: ranking, default=ranking)
     return record
 
@@ -213,6 +227,22 @@ def _maybe_freeze_snapshot(contest):
     locked_update(path, lambda _d: existing, default=existing)
 
 
+def _filter_leaderboard_rows(rows, contest):
+    """移除历史版本误写到每题成绩中的非法题目标识。"""
+    allowed = {p.get("problem_id") for p in contest.get("problems", []) if p.get("problem_id")}
+    if not allowed:
+        return rows
+    filtered = []
+    mode = contest.get("mode", "acm")
+    for row in rows:
+        rank = row.get("rank")
+        cleaned = _summarize(row, mode, 0, allowed_problem_ids=allowed)
+        if rank is not None:
+            cleaned["rank"] = rank
+        filtered.append(cleaned)
+    return filtered
+
+
 def get_leaderboard(contest, as_admin=False):
     """获取榜单。封榜期间非管理员看到冻结快照。"""
     path = _ranking_path(contest["id"])
@@ -221,10 +251,10 @@ def get_leaderboard(contest, as_admin=False):
         return {"contest_id": contest["id"], "rows": [], "frozen": False,
                 "frozen_at": None, "updated_at": None}
     frozen = is_frozen(contest)
-    rows = data.get("rows", [])
+    rows = _filter_leaderboard_rows(data.get("rows", []), contest)
     if frozen and not as_admin:
         snap = data.get("frozen_snapshot")
-        rows = snap if snap is not None else []
+        rows = _filter_leaderboard_rows(snap if snap is not None else [], contest)
     return {
         "contest_id": contest["id"],
         "mode": contest.get("mode", "acm"),
@@ -245,3 +275,91 @@ def reset_contest_scores(contest_id):
     import shutil
     shutil.rmtree(_score_dir(contest_id), ignore_errors=True)
     os.makedirs(_score_dir(contest_id), exist_ok=True)
+
+
+def rebuild_from_submissions(contest):
+    """按权威提交分片重建某场竞赛的成绩与聚合榜单。"""
+    from backend.judge import engine
+    from backend.utils import parse_time
+
+    contest_id = contest["id"]
+    mode = contest.get("mode", "acm")
+    penalty_seconds = int(config.DEFAULT_SETTINGS["ranking"]["penalty_seconds"])
+    allowed_problem_ids = {
+        p.get("problem_id") for p in contest.get("problems", []) if p.get("problem_id")
+    }
+    start = parse_time(contest.get("start_time"))
+    end = parse_time(contest.get("end_time"))
+
+    submissions = engine.list_submissions(
+        contest_id=contest_id, limit=10 ** 9, include_code=True
+    )["items"]
+    submissions.sort(key=lambda s: s.get("created_at", ""))
+
+    reset_contest_scores(contest_id)
+    users = {}
+    for s in submissions:
+        # 结束后的提交不进入正式榜单，保持与实时计榜规则一致。
+        created = parse_time(s.get("created_at"))
+        if end is not None and created is not None and created > end:
+            continue
+
+        user_id = s.get("user_id")
+        if not user_id:
+            continue
+        user = users.setdefault(user_id, {
+            "id": user_id,
+            "username": s.get("username", ""),
+            "nickname": s.get("nickname", ""),
+        })
+        if s.get("username"):
+            user["username"] = s["username"]
+        if s.get("nickname"):
+            user["nickname"] = s["nickname"]
+
+        record = get_user_record(contest_id, user_id)
+        if record is None:
+            record = empty_user_record(
+                contest_id, user_id, user["username"], user["nickname"]
+            )
+
+        problem_id = s.get("problem_id")
+        problems = record.setdefault("problems", {})
+        p = problems.setdefault(problem_id, {
+            "solved": False, "attempts": 0, "first_solve_time": None,
+            "score": 0, "time_ms": 0, "memory_kb": 0, "penalty": 0,
+        })
+
+        p["attempts"] += 1
+        p["time_ms"] = max(p["time_ms"], s.get("time_ms", 0) or 0)
+        p["memory_kb"] = max(p["memory_kb"], s.get("memory_kb", 0) or 0)
+
+        if s.get("status") == "AC":
+            if not p["solved"]:
+                p["solved"] = True
+                p["first_solve_time"] = s.get("judged_at") or s.get("created_at")
+                if mode == "acm" and start is not None and created is not None:
+                    elapsed = max(0, int(created - start))
+                    p["penalty"] = elapsed + (p["attempts"] - 1) * penalty_seconds
+            if mode == "ioi":
+                p["score"] = max(p["score"], s.get("score", 0) or 0)
+            else:
+                p["score"] = 1
+        elif mode == "ioi":
+            p["score"] = max(p["score"], s.get("score", 0) or 0)
+
+        atomic_write_json(_user_path(contest_id, user_id), record)
+
+    ranking = _rebuild_ranking(
+        contest_id, mode, penalty_seconds, allowed_problem_ids=allowed_problem_ids
+    )
+    locked_update(_ranking_path(contest_id), lambda _d: ranking, default=ranking)
+    return ranking
+
+
+def rebuild_all_leaderboards():
+    """按提交数据重建全部已有竞赛的榜单（用于修复历史派生成绩）。"""
+    for name in list_files(config.CONTESTS_DIR):
+        contest = read_json(os.path.join(config.CONTESTS_DIR, f"{name}.json"))
+        if contest:
+            rebuild_from_submissions(contest)
