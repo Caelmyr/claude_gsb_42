@@ -367,7 +367,7 @@ class JudgeEngine:
         updated = self._update_shard(sub_id, _upd)
         # 同步内存 recent 列表中的状态
         settings = read_json(config.SETTINGS_FILE, config.DEFAULT_SETTINGS)
-        if (settings or {}).get("judge", {}).get("sync_recent_cache", True):
+        if not (settings or {}).get("judge", {}).get("sync_recent_cache", True):
             return updated
         with self._lock:
             for s in self._recent:
